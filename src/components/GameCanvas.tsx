@@ -610,27 +610,18 @@ export default function GameCanvas({
       s.obstacles.push({ x: 450, y: 220, w: 25, h: 25, type: "gold_node", hp: 10 });
       s.obstacles.push({ x: 880, y: 60, w: 25, h: 25, type: "gold_node", hp: 10 });
 
-      // Spawn gateway portals at end of corridor according to activeRoom.connections!
-      activeRoom.connections.forEach((targetId, idx) => {
-        const targetNode = routeNodes.find((n) => n.id === targetId);
-        if (!targetNode) return;
-
-        // Position dynamically based on number of connections
-        let doorY = 160;
-        if (activeRoom.connections.length === 2) {
-          doorY = idx === 0 ? 90 : 230;
-        }
-
+      // Spawn gateway portal at end of corridor!
+      if (corridorTarget) {
         s.gateways.push({
-          id: "corridor_gate_" + targetId,
+          id: "corridor_portal",
           x: 1140,
-          y: doorY,
-          radius: 32,
-          targetNode,
-          name: getRoomNameKorean(targetNode.type),
-          color: getRoomColor(targetNode.type)
+          y: 160,
+          radius: 35,
+          targetNode: corridorTarget,
+          name: corridorTarget.type === RoomType.BOSS ? "⚠️ 보스 결전장" : `➡️ 다음 구역 [${corridorTarget.type}]`,
+          color: "#9c27b0"
         });
-      });
+      }
       return;
     }
 
@@ -700,17 +691,21 @@ export default function GameCanvas({
 
   const spawnPassiveGates = () => {
     const s = stateRef.current;
-    if (activeRoom.connections.length === 0) return;
+    // For non-hostile rooms, doors are instantly open!
+    activeRoom.connections.forEach((targetId, idx) => {
+      const targetNode = routeNodes.find((n) => n.id === targetId);
+      if (!targetNode) return;
 
-    // Spawn a single gateway in the center that transitions into the corridor hallway
-    s.gateways.push({
-      id: "gate_to_corridor",
-      x: 500,
-      y: 80,
-      radius: 32,
-      targetNode: routeNodes.find((n) => n.id === activeRoom.connections[0]) || activeRoom,
-      name: "➡️ 다음 복도 구역 진입 (Enter Corridor Hallway)",
-      color: "#9c27b0"
+      const doorX = activeRoom.connections.length === 1 ? 500 : 350 + idx * 300;
+      s.gateways.push({
+        id: "gate_" + targetId,
+        x: doorX,
+        y: 80,
+        radius: 30,
+        targetNode,
+        name: getRoomNameKorean(targetNode.type),
+        color: getRoomColor(targetNode.type)
+      });
     });
   };
 
@@ -1468,7 +1463,7 @@ export default function GameCanvas({
   // Re-setup room upon active room / floor changes or corridor transition
   useEffect(() => {
     setupRoom(isCorridor);
-  }, [activeRoom.id, playerStats.floor, isCorridor, corridorTarget]);
+  }, [activeRoom.id, playerStats.floor, isCorridor]);
 
   // Main tick loop
   useEffect(() => {
