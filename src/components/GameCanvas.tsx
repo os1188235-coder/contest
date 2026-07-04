@@ -71,6 +71,8 @@ interface Particle {
   size: number;
   life: number;
   maxLife: number;
+  isShellCasing?: boolean;
+  angle?: number;
 }
 
 interface FloatingText {
@@ -88,13 +90,13 @@ interface Obstacle {
   y: number;
   w: number;
   h: number;
-  type: "rock" | "crate" | "crystal_wall" | "torch" | "gold_node";
+  type: "rock" | "crate" | "crystal_wall" | "torch" | "gold_node" | "explosive_crystal" | "poison_pool" | "magic_circle";
   hp?: number;
 }
 
 interface GameEnemy {
   id: string;
-  type: "melee" | "charger" | "archer" | "boss";
+  type: "melee" | "charger" | "archer" | "caster" | "kamikaze" | "shield" | "summoner" | "summoned_bug" | "boss";
   x: number;
   y: number;
   vx: number;
@@ -105,6 +107,14 @@ interface GameEnemy {
   radius: number;
   color: string;
   shootCooldown: number;
+  hitFlashFrames?: number;
+  chargeTimer?: number;
+  chargeCooldown?: number;
+  isCharging?: boolean;
+  targetChargeX?: number;
+  targetChargeY?: number;
+  summonCount?: number;
+  shieldAngle?: number;
 }
 
 interface Projectile {
@@ -195,6 +205,29 @@ export default function GameCanvas({
 
   // Dynamic canvas width and height matching outer container
   const [dimensions, setDimensions] = useState({ width: 900, height: 520 });
+
+  // Game Feel Options
+  const [screenShakeOption, setScreenShakeOption] = useState<"NONE" | "LOW" | "NORMAL" | "HIGH">("NORMAL");
+  const [hitStopEnabled, setHitStopEnabled] = useState<boolean>(true);
+
+  // Victory / Cleared overlay typographic announcements
+  const [showClearBanner, setShowClearBanner] = useState<boolean>(false);
+  const [clearBannerType, setClearBannerType] = useState<string>("");
+
+  // Delayed yellow HP decay state
+  const [delayedHpPct, setDelayedHpPct] = useState<number>(100);
+
+  useEffect(() => {
+    const targetPct = (playerStats.hp / playerStats.maxHp) * 100;
+    const timer = setTimeout(() => {
+      if (delayedHpPct > targetPct) {
+        setDelayedHpPct(Math.max(targetPct, delayedHpPct - 0.75));
+      } else if (delayedHpPct < targetPct) {
+        setDelayedHpPct(targetPct); // snap upwards on heal
+      }
+    }, 20);
+    return () => clearTimeout(timer);
+  }, [playerStats.hp, playerStats.maxHp, delayedHpPct]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -439,7 +472,11 @@ export default function GameCanvas({
     drawPile: [] as BulletCard[],
     discardPile: [] as BulletCard[],
     lastFiredElement: null as ElementType | null,
-    comboCount: 0
+    comboCount: 0,
+    screenShake: 0,
+    hitStopFrames: 0,
+    recoilOffset: 0,
+    lastHitTime: 0
   });
 
   const getShotgunStats = () => {
@@ -454,6 +491,112 @@ export default function GameCanvas({
       if (p.statsMultiplier.recoil) recoilMult *= p.statsMultiplier.recoil;
     });
     return { damageMult, fireRateMult, spreadMult, recoilMult };
+  };
+
+  const generateDungeonObstacles = (w: number, h: number, type: RoomType) => {
+    const obs: Obstacle[] = [];
+    
+    // Density calculation:
+    // Small: 6-9 obstacles, Medium: 10-14, Large/Elite/Boss: 15-20 obstacles
+    let targetCount = 12;
+    if (type === RoomType.BOSS) {
+      targetCount = 7; // slightly fewer for boss battle area clearance
+    } else {
+      const area = w * h;
+      if (area < 600000) targetCount = 6 + Math.floor(Math.random() * 4);
+      else if (area < 900000) targetCount = 10 + Math.floor(Math.random() * 5);
+      else targetCount = 15 + Math.floor(Math.random() * 6);
+    }
+    
+    // 1. Central Obstacle (Rule: at least 1-2 medium pillars near center)
+    const centerX = w / 2;
+    const centerY = h / 2;
+    obs.push({
+      x: centerX - 25,
+      y: centerY - 25,
+      w: 50,
+      h: 50,
+      type: "crystal_wall" // Blocks bullets (Full Cover)
+    });
+    
+    if (type !== RoomType.BOSS && Math.random() < 0.65) {
+      obs.push({
+        x: centerX + 120,
+        y: centerY - 70,
+        w: 45,
+        h: 45,
+        type: "rock" // Partial Cover
+      });
+      obs.push({
+        x: centerX - 165,
+        y: centerY + 60,
+        w: 45,
+        h: 45,
+        type: "rock"
+      });
+    }
+
+    // Generate remaining obstacles procedurally
+    let spawned = obs.length;
+    let attempts = 0;
+    while (spawned < targetCount && attempts < 150) {
+      attempts++;
+      const ox = 100 + Math.random() * (w - 200);
+      const oy = 100 + Math.random() * (h - 200);
+      let ow = 35 + Math.floor(Math.random() * 20);
+      let oh = 35 + Math.floor(Math.random() * 20);
+      
+      // Select type: crystal_wall (full cover), rock/crate (partial cover), or hazard nodes
+      let otype: "rock" | "crate" | "crystal_wall" | "explosive_crystal" | "poison_pool" | "magic_circle" = "rock";
+      const roll = Math.random();
+      if (roll < 0.25) {
+        otype = "crystal_wall";
+      } else if (roll < 0.50) {
+        otype = "crate";
+      } else if (roll < 0.65) {
+        otype = "explosive_crystal";
+      } else if (roll < 0.82) {
+        otype = "poison_pool";
+      } else {
+        otype = "magic_circle";
+      }
+
+      if (otype === "poison_pool" || otype === "magic_circle") {
+        ow = 48;
+        oh = 48;
+      } else if (otype === "explosive_crystal") {
+        ow = 28;
+        oh = 28;
+      }
+
+      // Check distance from player initial spawn (500, 550) to prevent stuck
+      const distToSpawn = Math.sqrt(Math.pow(ox + ow/2 - 500, 2) + Math.pow(oy + oh/2 - 550, 2));
+      if (distToSpawn < 110) continue;
+
+      // Check spacing with existing obstacles (ensure zigzag clear pathways)
+      let overlap = false;
+      for (const existing of obs) {
+        if (!(ox + ow + 35 < existing.x || ox > existing.x + existing.w + 35 ||
+              oy + oh + 35 < existing.y || oy > existing.y + existing.h + 35)) {
+          overlap = true;
+          break;
+        }
+      }
+
+      if (!overlap) {
+        obs.push({
+          x: ox,
+          y: oy,
+          w: ow,
+          h: oh,
+          type: otype,
+          hp: otype === "explosive_crystal" ? 15 : undefined
+        });
+        spawned++;
+      }
+    }
+
+    return obs;
   };
 
   const setupRoom = () => {
@@ -521,10 +664,8 @@ export default function GameCanvas({
     s.player.vx = 0;
     s.player.vy = 0;
 
-    // Standard arena rocks
-    s.obstacles.push({ x: 250, y: 200, w: 50, h: 50, type: "rock" });
-    s.obstacles.push({ x: 700, y: 200, w: 50, h: 50, type: "rock" });
-    s.obstacles.push({ x: 475, y: 350, w: 50, h: 50, type: "crystal_wall" });
+    // Procedural obstacle layout generation!
+    s.obstacles = generateDungeonObstacles(1000, 800, activeRoom.type);
 
     // Room specific creations
     if (activeRoom.type === RoomType.TREASURE) {
@@ -665,28 +806,89 @@ export default function GameCanvas({
         speed: 1.0 * difficultySpeedMult,
         radius: 45,
         color: "#f87171",
-        shootCooldown: 80
+        shootCooldown: 80,
+        hitFlashFrames: 0
       });
     } else {
       for (let i = 0; i < count; i++) {
         const side = Math.random() < 0.5;
         const ex = side ? 100 + Math.random() * 200 : 700 + Math.random() * 200;
         const ey = 150 + Math.random() * 200;
-        const rollMelee = Math.random() < 0.6;
+        
+        // Randomly roll between: melee (25%), archer (20%), charger (15%), caster (15%), kamikaze (15%), shield (10%)
+        let etype: "melee" | "charger" | "archer" | "caster" | "kamikaze" | "shield" | "summoner" = "melee";
+        const roll = Math.random();
+        if (roll < 0.25) {
+          etype = "melee";
+        } else if (roll < 0.45) {
+          etype = "archer";
+        } else if (roll < 0.60) {
+          etype = "charger";
+        } else if (roll < 0.75) {
+          etype = "caster";
+        } else if (roll < 0.85) {
+          etype = "kamikaze";
+        } else if (roll < 0.93) {
+          etype = "shield";
+        } else {
+          etype = "summoner";
+        }
+
+        // Limit advanced mages on Floor 1 to keep it accessible
+        if (playerStats.floor === 1 && (etype === "caster" || etype === "summoner")) {
+          etype = Math.random() < 0.6 ? "melee" : "archer";
+        }
+
         const eHp = Math.round((20 + playerStats.floor * 15) * difficultyHpMult);
+        
+        // Custom stats and colors based on type
+        let rColor = "#a855f7";
+        let radius = 14;
+        let baseSpeed = 1.6;
+        if (etype === "melee") {
+          rColor = "#c084fc"; // purple beast
+          radius = 15;
+          baseSpeed = 1.15; // 75% speed
+        } else if (etype === "archer") {
+          rColor = "#3b82f6"; // blue marksman
+          radius = 13;
+          baseSpeed = 1.0; // 65% speed
+        } else if (etype === "charger") {
+          rColor = "#f43f5e"; // red charging bull
+          radius = 17;
+          baseSpeed = 1.05; // 70% speed
+        } else if (etype === "caster") {
+          rColor = "#ec4899"; // pink wizard
+          radius = 13;
+          baseSpeed = 0.9; // 60% speed
+        } else if (etype === "kamikaze") {
+          rColor = "#fb923c"; // orange firebug
+          radius = 11;
+          baseSpeed = 1.25; // 80% speed
+        } else if (etype === "shield") {
+          rColor = "#64748b"; // steel shield monster
+          radius = 16;
+          baseSpeed = 1.0; // 65% speed
+        } else if (etype === "summoner") {
+          rColor = "#10b981"; // green bug breeder
+          radius = 15;
+          baseSpeed = 0.8; // 55% speed
+        }
+
         s.enemies.push({
           id: `m_${s.waveCount}_${i}`,
-          type: rollMelee ? "melee" : "archer",
+          type: etype,
           x: ex,
           y: ey,
           vx: 0,
           vy: 0,
           hp: eHp,
           maxHp: eHp,
-          speed: (1.4 + Math.random() * 0.4) * difficultySpeedMult,
-          radius: 14,
-          color: rollMelee ? "#a855f7" : "#3b82f6",
-          shootCooldown: 60 + Math.random() * 50
+          speed: baseSpeed * difficultySpeedMult,
+          radius: radius,
+          color: rColor,
+          shootCooldown: 40 + Math.random() * 60,
+          hitFlashFrames: 0
         });
       }
     }
@@ -698,6 +900,17 @@ export default function GameCanvas({
     
     // Update routeNodes state so this room is clear
     setRouteNodes((prev) => prev.map((n) => n.id === activeRoom.id ? { ...n, clear: true } : n));
+
+    // Show beautiful typographic room clear alert banner!
+    if (activeRoom.type === RoomType.BOSS || activeRoom.type === RoomType.ELITE) {
+      setClearBannerType(activeRoom.type === RoomType.BOSS ? "💀 BOSS CONQUERED" : "😈 ELITE CONQUERED");
+      setShowClearBanner(true);
+      setTimeout(() => setShowClearBanner(false), 3200);
+    } else {
+      setClearBannerType("⚔️ AREA CLEARED");
+      setShowClearBanner(true);
+      setTimeout(() => setShowClearBanner(false), 2400);
+    }
 
     // Scatter small bonus Gold and scrap directly in room!
     const itemsCount = 3 + Math.floor(Math.random() * 3);
@@ -1010,6 +1223,29 @@ export default function GameCanvas({
     s.player.vx -= Math.cos(s.player.angle) * recoilSpeed;
     s.player.vy -= Math.sin(s.player.angle) * recoilSpeed;
 
+    // Trigger visual-only weapon recoil offsets
+    s.recoilOffset = 14 * activeBullet.space;
+
+    // Calculate Screen Shake intensity based on card rarity and space
+    let shakeIntensity = 4;
+    if (activeBullet.rarity === Rarity.LEGENDARY) shakeIntensity = 11;
+    else if (activeBullet.rarity === Rarity.EPIC) shakeIntensity = 8;
+    else if (activeBullet.rarity === Rarity.RARE) shakeIntensity = 5.5;
+    shakeIntensity *= activeBullet.space * 0.85;
+
+    if (screenShakeOption === "NONE") shakeIntensity = 0;
+    else if (screenShakeOption === "LOW") shakeIntensity *= 0.4;
+    else if (screenShakeOption === "HIGH") shakeIntensity *= 1.6;
+
+    s.screenShake = shakeIntensity;
+
+    // Trigger brief hit-stop/freeze frame on high-rarity firing
+    if (hitStopEnabled && activeBullet.rarity === Rarity.LEGENDARY) {
+      s.hitStopFrames = 4;
+    } else if (hitStopEnabled && activeBullet.rarity === Rarity.EPIC) {
+      s.hitStopFrames = 2;
+    }
+
     // Fire bullet projectiles!
     const pelletCount = activeBullet.space >= 2 ? 5 : 3;
     const baseDamage = activeBullet.damage * damageMult * comboDamageMultiplier;
@@ -1032,18 +1268,34 @@ export default function GameCanvas({
         isEnemy: false,
         element: activeBullet.element
       });
+
+      // Sparks and flash effects
+      for (let pIdx = 0; pIdx < 3; pIdx++) {
+        s.particles.push({
+          x: s.player.x + Math.cos(s.player.angle) * 15,
+          y: s.player.y + Math.sin(s.player.angle) * 15,
+          vx: Math.cos(personalAngle + (Math.random() - 0.5) * 0.4) * (6 + Math.random() * 5),
+          vy: Math.sin(personalAngle + (Math.random() - 0.5) * 0.4) * (6 + Math.random() * 5),
+          color: activeBullet.color,
+          size: 2.5 + Math.random() * 2,
+          life: 15 + Math.random() * 12,
+          maxLife: 25
+        });
+      }
     }
 
-    // Spawn brass particles
+    // Spawn brass shell casing particle with angle
     s.particles.push({
       x: s.player.x,
       y: s.player.y,
-      vx: Math.cos(s.player.angle - Math.PI / 2) * 3,
-      vy: Math.sin(s.player.angle - Math.PI / 2) * 3 - 1,
+      vx: Math.cos(s.player.angle - Math.PI / 1.8) * 3.5 + (Math.random() - 0.5) * 1.5,
+      vy: Math.sin(s.player.angle - Math.PI / 1.8) * 3.5 - 1.2 + (Math.random() - 0.5) * 1.5,
       color: "#f59e0b",
-      size: 3,
-      life: 40,
-      maxLife: 40
+      size: 3.5,
+      life: 60,
+      maxLife: 60,
+      isShellCasing: true,
+      angle: Math.random() * Math.PI * 2
     });
 
     s.player.fireCooldown = Math.round(25 / fireRateMult);
@@ -1272,6 +1524,29 @@ export default function GameCanvas({
     const updatePhysics = () => {
       const s = stateRef.current;
 
+      // 0. Hit stop logic (briefly freezes gameplay for maximum combat impacts)
+      if (s.hitStopFrames > 0) {
+        s.hitStopFrames--;
+        return;
+      }
+
+      // Decay screen shake & weapon recoil offsets
+      if (s.screenShake > 0) {
+        s.screenShake *= 0.88;
+        if (s.screenShake < 0.25) s.screenShake = 0;
+      }
+      if (s.recoilOffset > 0) {
+        s.recoilOffset -= 1.4;
+        if (s.recoilOffset < 0) s.recoilOffset = 0;
+      }
+
+      // Decrement hit flashes for hit feedback coloring
+      s.enemies.forEach((enemy) => {
+        if (enemy.hitFlashFrames !== undefined && enemy.hitFlashFrames > 0) {
+          enemy.hitFlashFrames--;
+        }
+      });
+
       // Slowmo time factor during card loading reload bullettime!
       const dt = isBulletTime ? 0.20 : 1.0;
 
@@ -1283,6 +1558,18 @@ export default function GameCanvas({
         if (s.player.rollDuration === 0) {
           s.player.isInvulnerable = false;
         }
+
+        // Spawn roll dash trails particles
+        s.particles.push({
+          x: s.player.x,
+          y: s.player.y,
+          vx: (Math.random() - 0.5) * 1.5,
+          vy: (Math.random() - 0.5) * 1.5,
+          color: selectedCharacter === "OVERSEER" ? "#fbbf24" : selectedCharacter === "SENTINEL" ? "#60a5fa" : "#c084fc",
+          size: 4,
+          life: 20,
+          maxLife: 20
+        });
       } else {
         // Normal move controls
         let dx = 0;
@@ -1343,10 +1630,52 @@ export default function GameCanvas({
         let collidedWall = false;
         s.obstacles.forEach((ob) => {
           if (proj.x > ob.x && proj.x < ob.x + ob.w && proj.y > ob.y && proj.y < ob.y + ob.h) {
+            if (ob.type === "poison_pool" || ob.type === "magic_circle") return; // walk through non-solid hazards
+
             collidedWall = true;
             // Draw damage to breakable nodes inside corridor
             if (ob.type === "gold_node" && !proj.isEnemy) {
               if (ob.hp !== undefined) ob.hp -= proj.damage;
+            }
+
+            // Handle explosive crystal reactive obstacles chain reaction!
+            if (ob.type === "explosive_crystal") {
+              if (ob.hp !== undefined) {
+                ob.hp -= proj.damage;
+                if (ob.hp <= 0) {
+                  const obCenterX = ob.x + ob.w / 2;
+                  const obCenterY = ob.y + ob.h / 2;
+                  
+                  // damage player
+                  const pDist = Math.sqrt(Math.pow(s.player.x - obCenterX, 2) + Math.pow(s.player.y - obCenterY, 2));
+                  if (pDist < 120 && !s.player.isInvulnerable) {
+                    damagePlayer(20);
+                  }
+                  
+                  // damage enemies
+                  s.enemies.forEach((enemy) => {
+                    const eDist = Math.sqrt(Math.pow(enemy.x - obCenterX, 2) + Math.pow(enemy.y - obCenterY, 2));
+                    if (eDist < 125) {
+                      enemy.hp -= 50;
+                      enemy.hitFlashFrames = 12;
+                      s.floatingTexts.push({
+                        id: `exp_ob_${Math.random()}`,
+                        x: enemy.x, y: enemy.y - 20,
+                        text: "💥 결정 대폭발 -50", color: "#f97316", vy: -1.5, life: 40
+                      });
+                    }
+                  });
+
+                  // Spawn big blast ring particles
+                  for (let k = 0; k < 18; k++) {
+                    s.particles.push({
+                      x: obCenterX, y: obCenterY, vx: (Math.random() - 0.5) * 8.5, vy: (Math.random() - 0.5) * 8.5,
+                      color: "#c084fc", size: 4.5, life: 25, maxLife: 25
+                    });
+                  }
+                  s.screenShake = 14;
+                }
+              }
             }
           }
         });
@@ -1377,8 +1706,41 @@ export default function GameCanvas({
           s.enemies.forEach((enemy) => {
             if (enemyHit) return;
             if (checkCircleCollision(proj.x, proj.y, proj.radius, enemy.x, enemy.y, enemy.radius)) {
+              
+              // Shield enemy blocking logic (from front shield angle)
+              if (enemy.type === "shield" && enemy.shieldAngle !== undefined) {
+                const projAngle = Math.atan2(proj.vy, proj.vx);
+                let diff = Math.abs(projAngle - (enemy.shieldAngle + Math.PI));
+                while (diff > Math.PI * 2) diff -= Math.PI * 2;
+                if (diff > Math.PI) diff = Math.PI * 2 - diff;
+                
+                if (diff < 1.1) { // roughly 60 degrees blocking cone from front
+                  enemyHit = true;
+                  s.floatingTexts.push({
+                    id: `blocked_${Math.random()}`,
+                    x: enemy.x, y: enemy.y - 15,
+                    text: "🛡️ BLOCKED", color: "#64748b", vy: -0.8, life: 25
+                  });
+                  // metal sparks
+                  for (let q = 0; q < 5; q++) {
+                    s.particles.push({
+                      x: enemy.x, y: enemy.y, vx: -proj.vx * 0.3 + (Math.random() - 0.5) * 4, vy: -proj.vy * 0.3 + (Math.random() - 0.5) * 4,
+                      color: "#cbd5e1", size: 2.5, life: 12, maxLife: 12
+                    });
+                  }
+                  return;
+                }
+              }
+
               enemy.hp -= proj.damage;
               enemyHit = true;
+              enemy.hitFlashFrames = 6; // Hit Flash Trigger
+
+              // Push/Knockback enemy
+              const knockBackForce = proj.radius >= 8 ? 4.5 : 2.0;
+              const angle = Math.atan2(proj.vy, proj.vx);
+              enemy.vx += Math.cos(angle) * knockBackForce;
+              enemy.vy += Math.sin(angle) * knockBackForce;
 
               // floating numbers
               s.floatingTexts.push({
@@ -1395,7 +1757,7 @@ export default function GameCanvas({
               for (let q = 0; q < 4; q++) {
                 s.particles.push({
                   x: enemy.x, y: enemy.y, vx: proj.vx * 0.2 + (Math.random() - 0.5) * 3, vy: proj.vy * 0.2 + (Math.random() - 0.5) * 3,
-                  color: "#e879f9", size: 2, life: 15, maxLife: 15
+                  color: proj.color, size: 2, life: 15, maxLife: 15
                 });
               }
 
@@ -1404,8 +1766,8 @@ export default function GameCanvas({
                 s.enemiesKilledInThisRoom++;
                 setPlayerStats((prev) => ({
                   ...prev,
-                  score: prev.score + (enemy.type === "boss" ? 5000 : 150),
-                  gold: prev.gold + (enemy.type === "boss" ? 60 : 6),
+                  score: prev.score + (enemy.type === "boss" ? 5000 : enemy.type === "summoned_bug" ? 10 : 150),
+                  gold: prev.gold + (enemy.type === "boss" ? 60 : enemy.type === "summoned_bug" ? 0 : 6),
                   kills: prev.kills + 1
                 }));
               }
@@ -1441,13 +1803,37 @@ export default function GameCanvas({
         }
       }
 
-      // 3. Enemies Chase Combat artificial intelligence
+      // 3. Enemies Chase Combat artificial intelligence with obstacle steering avoidance
       s.enemies.forEach((enemy) => {
         const pdx = s.player.x - enemy.x;
         const pdy = s.player.y - enemy.y;
         const dist = Math.sqrt(pdx * pdx + pdy * pdy);
 
-        // Slow chase AI
+        // Apply friction to enemy velocity/knockback
+        enemy.vx *= 0.75;
+        enemy.vy *= 0.75;
+        enemy.x += enemy.vx;
+        enemy.y += enemy.vy;
+
+        // Steering Obstacle Avoidance Vector calculation
+        let steerForceX = 0;
+        let steerForceY = 0;
+        s.obstacles.forEach((ob) => {
+          if (ob.type === "poison_pool" || ob.type === "magic_circle") return; // walkthrough hazards
+          const obCenterX = ob.x + ob.w / 2;
+          const obCenterY = ob.y + ob.h / 2;
+          const odx = enemy.x - obCenterX;
+          const ody = enemy.y - obCenterY;
+          const odist = Math.sqrt(odx * odx + ody * ody);
+          const influenceRange = Math.max(ob.w, ob.h) + 25;
+          if (odist < influenceRange && odist > 0) {
+            const force = (influenceRange - odist) / influenceRange;
+            steerForceX += (odx / odist) * force * 1.6;
+            steerForceY += (ody / odist) * force * 1.6;
+          }
+        });
+
+        // Unique Enemy Behavior state machines
         if (enemy.type === "boss") {
           // Boss emits waves of bullets!
           enemy.shootCooldown -= dt;
@@ -1458,37 +1844,163 @@ export default function GameCanvas({
               const rad = (angleDir * Math.PI) / 180;
               s.projectiles.push({
                 x: enemy.x, y: enemy.y,
-                vx: Math.cos(rad) * 4, vy: Math.sin(rad) * 4,
-                radius: 6, color: "#ef4444", damage: 15, isEnemy: true, element: ElementType.PHYSICAL
+                vx: Math.cos(rad) * 4.2, vy: Math.sin(rad) * 4.2,
+                radius: 7, color: "#ef4444", damage: 15, isEnemy: true, element: ElementType.PHYSICAL
               });
             }
           }
           // Slow approach
           if (dist > 150) {
-            enemy.x += (pdx / dist) * enemy.speed * dt;
-            enemy.y += (pdy / dist) * enemy.speed * dt;
+            enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+            enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
           }
-        } else {
-          // Melce or Archer chase
-          enemy.x += (pdx / dist) * enemy.speed * dt;
-          enemy.y += (pdy / dist) * enemy.speed * dt;
-
-          if (enemy.type === "melee") {
-            // Damage player upon touch
+        } else if (enemy.type === "charger") {
+          if (!enemy.chargeCooldown) enemy.chargeCooldown = 150;
+          if (enemy.isCharging) {
+            // High speed lock dash
+            const tdx = (enemy.targetChargeX || s.player.x) - enemy.x;
+            const tdy = (enemy.targetChargeY || s.player.y) - enemy.y;
+            const tdist = Math.sqrt(tdx * tdx + tdy * tdy);
+            if (tdist > 12) {
+              enemy.x += (tdx / tdist) * enemy.speed * 4.5 * dt;
+              enemy.y += (tdy / tdist) * enemy.speed * 4.5 * dt;
+              // Spawn dust particles
+              s.particles.push({
+                x: enemy.x, y: enemy.y, vx: (Math.random() - 0.5) * 2, vy: (Math.random() - 0.5) * 2,
+                color: "#ff3366", size: 3, life: 12, maxLife: 12
+              });
+            } else {
+              enemy.isCharging = false;
+              enemy.chargeCooldown = 140; // recharge duration
+            }
             if (dist < enemy.radius + s.player.radius && !s.player.isInvulnerable) {
-              damagePlayer(10);
+              damagePlayer(15);
+              enemy.isCharging = false;
+              enemy.chargeCooldown = 180;
             }
           } else {
-            // Archer fires single shot
-            enemy.shootCooldown -= dt;
-            if (enemy.shootCooldown <= 0) {
-              enemy.shootCooldown = 120 + Math.random() * 60;
-              s.projectiles.push({
-                x: enemy.x, y: enemy.y,
-                vx: (pdx / dist) * 5.5, vy: (pdy / dist) * 5.5,
-                radius: 4, color: "#3b82f6", damage: 8, isEnemy: true, element: ElementType.PHYSICAL
+            enemy.chargeCooldown -= dt;
+            if (dist < 200 && enemy.chargeCooldown <= 0) {
+              enemy.isCharging = true;
+              enemy.targetChargeX = s.player.x + (s.player.vx * 15); // predict player direction!
+              enemy.targetChargeY = s.player.y + (s.player.vy * 15);
+              s.floatingTexts.push({
+                id: `charge_${enemy.id}`,
+                x: enemy.x, y: enemy.y - 20,
+                text: "⚠️ CHARGE!", color: "#ff2255", vy: -1.5, life: 40
+              });
+            } else {
+              enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+              enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+            }
+          }
+        } else if (enemy.type === "caster") {
+          enemy.shootCooldown -= dt;
+          if (enemy.shootCooldown <= 0) {
+            enemy.shootCooldown = 130 + Math.random() * 50;
+            s.projectiles.push({
+              x: enemy.x, y: enemy.y,
+              vx: (pdx / dist) * 4.0, vy: (pdy / dist) * 4.0,
+              radius: 6, color: "#ec4899", damage: 11, isEnemy: true, element: ElementType.PHYSICAL
+            });
+          }
+          if (dist > 220) {
+            enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+            enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          } else {
+            // back pedal away
+            enemy.x -= ((pdx / dist) - steerForceX) * enemy.speed * 0.5 * dt;
+            enemy.y -= ((pdy / dist) - steerForceY) * enemy.speed * 0.5 * dt;
+          }
+        } else if (enemy.type === "kamikaze") {
+          if (dist < 45) {
+            damagePlayer(25);
+            enemy.hp = 0; // dies
+            for (let k = 0; k < 15; k++) {
+              s.particles.push({
+                x: enemy.x, y: enemy.y, vx: (Math.random() - 0.5) * 9, vy: (Math.random() - 0.5) * 9,
+                color: "#f97316", size: 4, life: 25, maxLife: 25
               });
             }
+            s.screenShake = 12;
+            s.floatingTexts.push({
+              id: `exp_${enemy.id}`,
+              x: enemy.x, y: enemy.y - 20,
+              text: "💥 DETONATED!", color: "#f97316", vy: -2.0, life: 40
+            });
+          } else {
+            enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+            enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          }
+        } else if (enemy.type === "shield") {
+          enemy.shieldAngle = Math.atan2(pdy, pdx);
+          enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+          enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          if (dist < enemy.radius + s.player.radius && !s.player.isInvulnerable) {
+            damagePlayer(8);
+          }
+        } else if (enemy.type === "summoner") {
+          if (enemy.summonCount === undefined) enemy.summonCount = 0;
+          enemy.shootCooldown -= dt;
+          if (enemy.shootCooldown <= 0 && enemy.summonCount < 3) {
+            enemy.shootCooldown = 220 + Math.random() * 80;
+            enemy.summonCount++;
+            s.enemies.push({
+              id: `bug_${Math.random()}`,
+              type: "summoned_bug",
+              x: enemy.x + (Math.random() - 0.5) * 45,
+              y: enemy.y + (Math.random() - 0.5) * 45,
+              vx: 0, vy: 0,
+              hp: 12, maxHp: 12,
+              speed: 2.2,
+              radius: 8,
+              color: "#34d399",
+              shootCooldown: 9999,
+              hitFlashFrames: 0
+            });
+            s.floatingTexts.push({
+              id: `spawn_${enemy.id}`,
+              x: enemy.x, y: enemy.y - 15,
+              text: "🕷️ Parasite Spawned!", color: "#34d399", vy: -0.8, life: 30
+            });
+          }
+          if (dist > 300) {
+            enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+            enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          } else {
+            enemy.x -= ((pdx / dist) - steerForceX) * enemy.speed * 0.7 * dt;
+            enemy.y -= ((pdy / dist) - steerForceY) * enemy.speed * 0.7 * dt;
+          }
+        } else if (enemy.type === "summoned_bug") {
+          enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+          enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          if (dist < enemy.radius + s.player.radius && !s.player.isInvulnerable) {
+            damagePlayer(5);
+            enemy.hp = 0; // self-destruct upon biting
+          }
+        } else if (enemy.type === "melee") {
+          enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+          enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          if (dist < enemy.radius + s.player.radius && !s.player.isInvulnerable) {
+            damagePlayer(10);
+          }
+        } else if (enemy.type === "archer") {
+          enemy.shootCooldown -= dt;
+          if (enemy.shootCooldown <= 0) {
+            enemy.shootCooldown = 120 + Math.random() * 60;
+            s.projectiles.push({
+              x: enemy.x, y: enemy.y,
+              vx: (pdx / dist) * 5.5, vy: (pdy / dist) * 5.5,
+              radius: 4, color: "#3b82f6", damage: 8, isEnemy: true, element: ElementType.PHYSICAL
+            });
+          }
+          if (dist > 200) {
+            enemy.x += ((pdx / dist) + steerForceX) * enemy.speed * dt;
+            enemy.y += ((pdy / dist) + steerForceY) * enemy.speed * dt;
+          } else {
+            // strafe around obstacles
+            enemy.x += steerForceX * enemy.speed * dt;
+            enemy.y += steerForceY * enemy.speed * dt;
           }
         }
       });
@@ -1654,11 +2166,38 @@ export default function GameCanvas({
 
     const drawGame = (c: CanvasRenderingContext2D) => {
       const s = stateRef.current;
+      
+      // Clear canvas
       c.clearRect(0, 0, canvas.width, canvas.height);
 
       c.save();
+      
+      // Momentary hit-flash screen desaturation filter
+      const timeSinceHit = Date.now() - s.lastHitTime;
+      if (timeSinceHit < 250) {
+        c.filter = `saturate(${Math.max(0.15, timeSinceHit / 250)})`;
+      } else {
+        c.filter = "none";
+      }
+
+      // Calculate dynamic camera offsets with screen shake jitter!
+      let shakeOffsetX = 0;
+      let shakeOffsetY = 0;
+      if (s.screenShake > 0) {
+        shakeOffsetX = (Math.random() - 0.5) * s.screenShake;
+        shakeOffsetY = (Math.random() - 0.5) * s.screenShake;
+      }
+
       c.scale(ZOOM_FACTOR, ZOOM_FACTOR);
-      c.translate(-s.camera.x, -s.camera.y);
+      c.translate(-s.camera.x + shakeOffsetX, -s.camera.y + shakeOffsetY);
+
+      // Draw ground shadow helper
+      const drawGroundShadow = (cx: number, cy: number, radius: number) => {
+        c.fillStyle = "rgba(0, 0, 0, 0.35)";
+        c.beginPath();
+        c.ellipse(cx, cy + radius * 0.85, radius * 0.9, radius * 0.35, 0, 0, Math.PI * 2);
+        c.fill();
+      };
 
       // 1. Draw Ground Floor Grid
       const bounds = s.roomBounds;
@@ -1676,7 +2215,7 @@ export default function GameCanvas({
         c.beginPath(); c.moveTo(0, y); c.lineTo(bounds.w, y); c.stroke();
       }
 
-      // 2. Draw Torches or Crystals inside corridor
+      // 2. Draw Obstacles (procedural / cover rocks & explosive crystals)
       s.obstacles.forEach((ob) => {
         if (ob.type === "torch") {
           // Draw wall mount torch
@@ -1699,15 +2238,58 @@ export default function GameCanvas({
           c.font = "8px monospace";
           c.fillText("ORE", ob.x + 4, ob.y - 4);
         } else if (ob.type === "crystal_wall") {
+          // Blocks bullets (Full Cover)
           c.fillStyle = "#701a75";
           c.fillRect(ob.x, ob.y, ob.w, ob.h);
           c.strokeStyle = "#d946ef";
           c.lineWidth = 2;
           c.strokeRect(ob.x, ob.y, ob.w, ob.h);
+        } else if (ob.type === "explosive_crystal") {
+          // Purple glowing explosive spire (Chain reaction trigger!)
+          c.save();
+          c.shadowColor = "#c084fc";
+          c.shadowBlur = 8;
+          c.fillStyle = "#86198f";
+          c.beginPath();
+          c.moveTo(ob.x + ob.w/2, ob.y);
+          c.lineTo(ob.x + ob.w, ob.y + ob.h/2);
+          c.lineTo(ob.x + ob.w * 0.7, ob.y + ob.h);
+          c.lineTo(ob.x + ob.w * 0.3, ob.y + ob.h);
+          c.lineTo(ob.x, ob.y + ob.h/2);
+          c.closePath();
+          c.fill();
+          
+          c.strokeStyle = "#e879f9";
+          c.lineWidth = 1.5;
+          c.stroke();
+          
+          c.fillStyle = "#f472b6";
+          c.font = "bold 8px monospace";
+          c.fillText("💥", ob.x + ob.w/2 - 4, ob.y + ob.h/2 + 3);
+          c.restore();
+        } else if (ob.type === "poison_pool") {
+          c.fillStyle = "rgba(34, 197, 94, 0.22)";
+          c.strokeStyle = "#22c55e";
+          c.lineWidth = 2;
+          c.beginPath();
+          c.ellipse(ob.x + ob.w/2, ob.y + ob.h/2, ob.w/2, ob.h/3, 0, 0, Math.PI*2);
+          c.fill();
+          c.stroke();
+        } else if (ob.type === "magic_circle") {
+          c.fillStyle = "rgba(6, 182, 212, 0.12)";
+          c.strokeStyle = "rgba(6, 182, 212, 0.4)";
+          c.lineWidth = 1.5;
+          c.beginPath();
+          c.arc(ob.x + ob.w/2, ob.y + ob.h/2, ob.w/2, 0, Math.PI*2);
+          c.fill();
+          c.stroke();
         } else {
-          // normal rock pile
+          // Normal partial cover (rocks/crates)
           c.fillStyle = "#334155";
           c.fillRect(ob.x, ob.y, ob.w, ob.h);
+          c.strokeStyle = "#475569";
+          c.lineWidth = 1.5;
+          c.strokeRect(ob.x, ob.y, ob.w, ob.h);
         }
       });
 
@@ -1772,12 +2354,107 @@ export default function GameCanvas({
         c.restore();
       });
 
-      // 6. Draw Enemies Unit circles
+      // 6. Draw Enemies with distinct custom sprites / silhouettes & shadows
       s.enemies.forEach((enemy) => {
-        c.fillStyle = enemy.color;
-        c.beginPath();
-        c.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
-        c.fill();
+        // Ground shadow first
+        drawGroundShadow(enemy.x, enemy.y, enemy.radius);
+
+        c.save();
+        
+        // Brief white flash on hit
+        if (enemy.hitFlashFrames && enemy.hitFlashFrames > 0) {
+          c.shadowBlur = 15;
+          c.shadowColor = "#ffffff";
+          c.fillStyle = "#ffffff";
+        } else {
+          c.fillStyle = enemy.color;
+        }
+
+        // Distinct enemy types silhouettes
+        if (enemy.type === "boss") {
+          // Spiked behemoth boss
+          c.beginPath();
+          c.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+          c.fill();
+          
+          c.fillStyle = "#fb923c"; // glowing orange crown spikes
+          c.beginPath();
+          c.moveTo(enemy.x - 30, enemy.y - 35);
+          c.lineTo(enemy.x - 12, enemy.y - 52);
+          c.lineTo(enemy.x - 14, enemy.y - 32);
+          c.fill();
+          
+          c.beginPath();
+          c.moveTo(enemy.x + 30, enemy.y - 35);
+          c.lineTo(enemy.x + 12, enemy.y - 52);
+          c.lineTo(enemy.x + 14, enemy.y - 32);
+          c.fill();
+        } else if (enemy.type === "charger") {
+          // Sharp bull triangular shape
+          c.beginPath();
+          const angle = Math.atan2(s.player.y - enemy.y, s.player.x - enemy.x);
+          c.moveTo(enemy.x + Math.cos(angle) * enemy.radius * 1.4, enemy.y + Math.sin(angle) * enemy.radius * 1.4);
+          c.lineTo(enemy.x + Math.cos(angle + 2.3) * enemy.radius, enemy.y + Math.sin(angle + 2.3) * enemy.radius);
+          c.lineTo(enemy.x + Math.cos(angle - 2.3) * enemy.radius, enemy.y + Math.sin(angle - 2.3) * enemy.radius);
+          c.closePath();
+          c.fill();
+          
+          // Charge laser-sight warning path line
+          if (enemy.isCharging) {
+            c.strokeStyle = "rgba(244, 63, 94, 0.5)";
+            c.lineWidth = 1.5;
+            c.beginPath();
+            c.moveTo(enemy.x, enemy.y);
+            c.lineTo(enemy.targetChargeX || s.player.x, enemy.targetChargeY || s.player.y);
+            c.stroke();
+          }
+        } else if (enemy.type === "shield") {
+          c.beginPath();
+          c.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+          c.fill();
+          
+          // heavy steel front shield segment
+          if (enemy.shieldAngle !== undefined) {
+            c.strokeStyle = "#94a3b8";
+            c.lineWidth = 5;
+            c.beginPath();
+            c.arc(enemy.x, enemy.y, enemy.radius + 3.5, enemy.shieldAngle - 0.75, enemy.shieldAngle + 0.75);
+            c.stroke();
+          }
+        } else if (enemy.type === "caster") {
+          // diamond hover wizard
+          c.beginPath();
+          c.moveTo(enemy.x, enemy.y - enemy.radius * 1.35);
+          c.lineTo(enemy.x + enemy.radius, enemy.y);
+          c.lineTo(enemy.x, enemy.y + enemy.radius * 1.35);
+          c.lineTo(enemy.x - enemy.radius, enemy.y);
+          c.closePath();
+          c.fill();
+          // magical cyan core
+          c.fillStyle = "#ffffff";
+          c.beginPath();
+          c.arc(enemy.x, enemy.y, 4, 0, Math.PI*2);
+          c.fill();
+        } else if (enemy.type === "summoner") {
+          c.beginPath();
+          c.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+          c.fill();
+          // Green glowing antennas
+          c.strokeStyle = "#34d399";
+          c.lineWidth = 2.5;
+          c.beginPath();
+          c.moveTo(enemy.x - 4, enemy.y - 8);
+          c.lineTo(enemy.x - 11, enemy.y - 20);
+          c.moveTo(enemy.x + 4, enemy.y - 8);
+          c.lineTo(enemy.x + 11, enemy.y - 20);
+          c.stroke();
+        } else {
+          // melee / archer / bug
+          c.beginPath();
+          c.arc(enemy.x, enemy.y, enemy.radius, 0, Math.PI * 2);
+          c.fill();
+        }
+        c.restore();
 
         // HP bar red
         const barW = enemy.radius * 1.5;
@@ -1795,12 +2472,22 @@ export default function GameCanvas({
         c.fill();
       });
 
-      // 8. Draw particles
+      // 8. Draw particles with rotating shell casing support
       s.particles.forEach((p) => {
-        c.fillStyle = p.color;
-        c.beginPath();
-        c.arc(p.x, p.y, p.size * (p.life / p.maxLife), 0, Math.PI * 2);
-        c.fill();
+        if (p.isShellCasing && p.angle !== undefined) {
+          c.save();
+          c.translate(p.x, p.y);
+          c.rotate(p.angle);
+          c.fillStyle = p.color;
+          c.fillRect(-2.5, -1.25, 5, 2.5); // long brass cylinder
+          c.restore();
+          p.angle += 0.08; // dynamic casing tumble rotation
+        } else {
+          c.fillStyle = p.color;
+          c.beginPath();
+          c.arc(p.x, p.y, p.size * (p.life / p.maxLife), 0, Math.PI * 2);
+          c.fill();
+        }
       });
 
       // 9. Draw floating numbers texts
@@ -1811,13 +2498,15 @@ export default function GameCanvas({
         c.fillText(t.text, t.x, t.y);
       });
 
-      // 10. Draw Player Unit Circle
+      // 10. Draw Player Unit Circle & weapon part overlays
+      drawGroundShadow(s.player.x, s.player.y, s.player.radius);
+
       c.save();
       if (s.player.isInvulnerable) {
-        c.strokeStyle = "#4ade80";
-        c.lineWidth = 3;
+        c.strokeStyle = "#10b981";
+        c.lineWidth = 2.5;
         c.beginPath();
-        c.arc(s.player.x, s.player.y, s.player.radius + 5, 0, Math.PI * 2);
+        c.arc(s.player.x, s.player.y, s.player.radius + 6, 0, Math.PI * 2);
         c.stroke();
       }
 
@@ -1833,19 +2522,67 @@ export default function GameCanvas({
       c.arc(s.player.x, s.player.y, s.player.radius, 0, Math.PI * 2);
       c.fill();
 
-      // Add a small decorative core inside the player
+      // Add a small decorative central glowing core inside the player
       c.fillStyle = "#ffffff";
       c.beginPath();
-      c.arc(s.player.x, s.player.y, s.player.radius * 0.45, 0, Math.PI * 2);
+      c.arc(s.player.x, s.player.y, s.player.radius * 0.42, 0, Math.PI * 2);
       c.fill();
 
-      // Draw aim-line gun pointing
-      c.strokeStyle = "#ffffff";
-      c.lineWidth = 4.0;
+      // Draw custom-styled weapon part overlays attached directly to gun pointing line!
+      const gunAngle = s.player.angle;
+      // Recoil visual kickback factor!
+      const finalRecoilX = -Math.cos(gunAngle) * s.recoilOffset;
+      const finalRecoilY = -Math.sin(gunAngle) * s.recoilOffset;
+
+      const barrelLength = 26;
+      const muzzleX = s.player.x + finalRecoilX + Math.cos(gunAngle) * barrelLength;
+      const muzzleY = s.player.y + finalRecoilY + Math.sin(gunAngle) * barrelLength;
+
+      // Draw customizable visual gun representation
+      c.strokeStyle = "#334155";
+      c.lineWidth = 5.0;
       c.beginPath();
-      c.moveTo(s.player.x, s.player.y);
-      c.lineTo(s.player.x + Math.cos(s.player.angle) * 27, s.player.y + Math.sin(s.player.angle) * 27);
+      c.moveTo(s.player.x + finalRecoilX, s.player.y + finalRecoilY);
+      c.lineTo(muzzleX, muzzleY);
       c.stroke();
+
+      // Draw parts modifiers visually
+      // 1. Grip/Pump Part: Green segment under the barrel
+      if (equippedParts.some((p) => p.slot === SlotType.PUMP)) {
+        c.strokeStyle = "#10b981";
+        c.lineWidth = 3.0;
+        c.beginPath();
+        c.moveTo(s.player.x + finalRecoilX + Math.cos(gunAngle) * 8, s.player.y + finalRecoilY + Math.sin(gunAngle) * 8);
+        c.lineTo(s.player.x + finalRecoilX + Math.cos(gunAngle) * 16, s.player.y + finalRecoilY + Math.sin(gunAngle) * 16);
+        c.stroke();
+      }
+
+      // 2. Muzzle Break Part: cyan flashing rings at muzzle tip!
+      if (equippedParts.some((p) => p.slot === SlotType.BARREL)) {
+        c.fillStyle = "#22d3ee";
+        c.beginPath();
+        c.arc(muzzleX, muzzleY, 4.5, 0, Math.PI * 2);
+        c.fill();
+      }
+
+      // 3. Aux Sight Part: Yellow dot above the player's core
+      if (equippedParts.some((p) => p.slot === SlotType.AUXILIARY)) {
+        c.fillStyle = "#f59e0b";
+        c.beginPath();
+        c.arc(s.player.x + finalRecoilX + Math.cos(gunAngle + 0.35) * 10, s.player.y + finalRecoilY + Math.sin(gunAngle + 0.35) * 10, 2.5, 0, Math.PI * 2);
+        c.fill();
+      }
+
+      // 4. Stock Part: rear dark backing plate on shotgun
+      if (equippedParts.some((p) => p.slot === SlotType.STOCK)) {
+        c.strokeStyle = "#475569";
+        c.lineWidth = 6;
+        c.beginPath();
+        c.moveTo(s.player.x + finalRecoilX - Math.cos(gunAngle) * 6, s.player.y + finalRecoilY - Math.sin(gunAngle) * 6);
+        c.lineTo(s.player.x + finalRecoilX - Math.cos(gunAngle) * 11, s.player.y + finalRecoilY - Math.sin(gunAngle) * 11);
+        c.stroke();
+      }
+
       c.restore();
 
       c.restore(); // camera restore
@@ -2084,35 +2821,35 @@ export default function GameCanvas({
 
       {/* Slay the Spire Beautiful Fanned-Out Hand Reload Overlay */}
       {isBulletTime && (
-        <div className="absolute inset-0 bg-[#07050cd8] backdrop-blur-[1px] z-40 select-none flex flex-col justify-end overflow-visible pb-12">
+        <div className="absolute inset-0 pointer-events-none z-40 select-none flex flex-col justify-end overflow-visible pb-12">
           
           {/* Lightened, subtle gradient overlay */}
-          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent pointer-events-none -z-10" />
+          <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent pointer-events-none -z-10" />
 
           {/* Centered Bullet-Time Header banner */}
           <div className="absolute top-4 inset-x-0 flex flex-col items-center gap-0.5 text-center pointer-events-none">
-            <span className="inline-flex items-center gap-2 px-3.5 py-1 bg-[#1e152a] border border-purple-500/30 text-purple-200 text-[10px] font-mono font-black uppercase tracking-wider animate-pulse rounded shadow-lg">
+            <span className="inline-flex items-center gap-2 px-3.5 py-1 bg-[#1e152a]/95 border border-purple-500/35 text-purple-200 text-[10px] font-mono font-black uppercase tracking-wider animate-pulse rounded shadow-lg">
               ⏳ 슬레이 더 스파이어 마력 장전 제어장치 (Reloading Tactical Board)
             </span>
-            <p className="text-[9px] text-gray-400 font-mono tracking-wide mt-1 max-w-sm">
+            <p className="text-[9px] text-gray-300 font-mono tracking-wide mt-1 max-w-sm drop-shadow-[0_1.5px_3px_rgba(0,0,0,0.8)]">
               손에 쥔 카드를 클릭하거나 아래 자동 버튼을 통해 탄창을 충전하세요!
             </p>
           </div>
 
           {/* Floating Attribute Type Combo Guide Panel on the top left */}
-          <div className="absolute top-4 left-4 z-50 p-2.5 bg-black/90 rounded-lg border border-purple-500/30 font-mono text-[8px] text-gray-400 max-w-[200px] pointer-events-none">
+          <div className="absolute top-4 left-4 z-50 p-2.5 bg-black/95 rounded-lg border border-purple-500/35 font-mono text-[8px] text-gray-400 max-w-[200px] pointer-events-none shadow-md">
             <span className="text-[8.5px] font-black text-purple-400 block mb-1">🧪 속성 융합 반응 가이드 (Combo Charts)</span>
             <div className="space-y-1">
               <div><strong className="text-orange-400">🔥 화염 + ❄️ 빙결</strong>: <span className="text-white">열충격 (+60 광역 고정피해)</span></div>
               <div><strong className="text-yellow-400">⚡ 번개 + 🌌 공허</strong>: <span className="text-white">공허 감전 (-45 인력 자석감전)</span></div>
-              <div className="border-t border-white/5 pt-1 mt-1 text-gray-500">
+              <div className="border-t border-white/10 pt-1 mt-1 text-gray-500">
                 동일 속성 3회 연속 격발 시 <span className="text-yellow-300">화염 과부하(+35%), 한파(둔화 50%), 낙뢰 타격(-25), 공허 뒤틀림(+50%)</span> 발동!
               </div>
             </div>
           </div>
 
           {/* Active Chamber visual queue gauge */}
-          <div className="absolute top-18 inset-x-0 flex flex-col items-center gap-1.5 pb-2">
+          <div className="absolute top-18 inset-x-0 flex flex-col items-center gap-1.5 pb-2 pointer-events-auto">
             <div className="flex items-center gap-2 bg-black/90 px-4 py-1.5 rounded-lg border border-purple-500/20 text-[10px] font-mono text-gray-400">
               <span className="text-[#a855f7] font-black uppercase tracking-widest">
                 약실 상태 (Gauge): {chamber.reduce((sum, c) => sum + c.space, 0)} / {chamberCapacity} 칸
