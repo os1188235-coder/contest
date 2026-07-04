@@ -1,0 +1,6 @@
+{
+  "name": "Abyss Crystal Hunter",
+  "description": "A 2D top-down action roguelike game featuring bullet-time card bullet loading and modular shotgun customization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
