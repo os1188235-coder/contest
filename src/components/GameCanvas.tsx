@@ -300,6 +300,16 @@ export default function GameCanvas({
     }
   }, [isBulletTime]);
 
+  // Backup sync: Automatically switch to shooting mode if chamber is fully loaded during bullet time
+  useEffect(() => {
+    if (isBulletTime) {
+      const currentSpace = chamber.reduce((sum, c) => sum + c.space, 0);
+      if (currentSpace >= chamberCapacity) {
+        setIsBulletTime(false);
+      }
+    }
+  }, [chamber, chamberCapacity, isBulletTime, setIsBulletTime]);
+
   const loadCardFromHandIdx = (index: number) => {
     const card = hand[index];
     const s = stateRef.current;
@@ -319,117 +329,76 @@ export default function GameCanvas({
       return;
     }
 
+    const newBullet = { ...card, id: card.id + "_" + Math.random() };
+    const nextChamber = [...chamber, newBullet];
+
     // Load to shotgun chamber FIFO array
-    setChamber((prev) => [...prev, { ...card, id: card.id + "_" + Math.random() }]);
+    setChamber(nextChamber);
 
     // Remove from active hand array
     setHand((prev) => {
       const next = [...prev];
       next.splice(index, 1);
+      
+      // Instantly top-up hand up to 5 cards from the deck (draw pile)
+      const countNeeded = 5 - next.length;
+      if (countNeeded > 0) {
+        let currentDraw = [...stateRef.current.drawPile];
+        let currentDiscard = [...stateRef.current.discardPile];
+        const drawn: BulletCard[] = [];
+
+        for (let i = 0; i < countNeeded; i++) {
+          if (currentDraw.length === 0) {
+            if (currentDiscard.length === 0) {
+              break;
+            }
+            currentDraw = shuffleArray(currentDiscard);
+            currentDiscard = [];
+
+            stateRef.current.floatingTexts.push({
+              id: "auto_redraw_shuffle_" + Math.random(),
+              x: stateRef.current.player.x,
+              y: stateRef.current.player.y - 35,
+              text: "🔄 버린 패를 모아 덱 셔플! (Deck Recycled)",
+              color: "#c084fc",
+              vy: -1.2,
+              life: 75
+            });
+          }
+          const card = currentDraw.pop();
+          if (card) {
+            drawn.push(card);
+          }
+        }
+
+        stateRef.current.drawPile = currentDraw;
+        stateRef.current.discardPile = currentDiscard;
+
+        if (drawn.length > 0) {
+          stateRef.current.floatingTexts.push({
+            id: "auto_redraw_draw_" + Math.random(),
+            x: stateRef.current.player.x,
+            y: stateRef.current.player.y - 60,
+            text: `✨ 카드 보충! 덱에서 ${drawn.length}장 드로우 (Auto Drawn)`,
+            color: "#38bdf8",
+            vy: -1.4,
+            life: 60
+          });
+        }
+
+        return [...next, ...drawn];
+      }
       return next;
     });
-  };
 
-  const autoReloadChamber = () => {
-    const s = stateRef.current;
-    let tempChamber = [...chamber];
-    let tempHand = [...hand];
-    let added = false;
-    
-    // 1. Load from hand first
-    for (let i = 0; i < tempHand.length; i++) {
-      const card = tempHand[i];
-      const currentSpace = tempChamber.reduce((sum, c) => sum + c.space, 0);
-      if (currentSpace + card.space <= chamberCapacity) {
-        tempChamber.push({ ...card, id: card.id + "_" + Math.random() });
-        tempHand.splice(i, 1);
-        i--;
-        added = true;
-      }
-    }
-    
-    // 2. Load from draw pile
-    let currentDraw = [...s.drawPile];
-    let currentDiscard = [...s.discardPile];
-    while (tempChamber.reduce((sum, c) => sum + c.space, 0) < chamberCapacity) {
-      if (currentDraw.length === 0) {
-        if (currentDiscard.length === 0) break;
-        currentDraw = shuffleArray(currentDiscard);
-        currentDiscard = [];
-      }
-      const card = currentDraw.pop();
-      if (card) {
-        const currentSpace = tempChamber.reduce((sum, c) => sum + c.space, 0);
-        if (currentSpace + card.space <= chamberCapacity) {
-          tempChamber.push({ ...card, id: card.id + "_" + Math.random() });
-          added = true;
-        } else {
-          currentDraw.push(card);
-          break;
-        }
-      } else {
-        break;
-      }
-    }
-    
-    s.drawPile = currentDraw;
-    s.discardPile = currentDiscard;
-    setChamber(tempChamber);
-    setHand(tempHand);
-    
-    if (added) {
-      s.floatingTexts.push({
-        id: "auto_load_" + Math.random(),
-        x: s.player.x,
-        y: s.player.y - 40,
-        text: "⚡ 일괄 신속 장전 완료! (Auto Filled)",
-        color: "#10b981",
-        vy: -1.3,
-        life: 50
-      });
+    // Auto-exit bullet time if fully loaded
+    const nextSpace = nextChamber.reduce((sum, c) => sum + c.space, 0);
+    if (nextSpace >= chamberCapacity) {
+      setIsBulletTime(false);
     }
   };
 
-  const discardAndRedrawHand = () => {
-    const s = stateRef.current;
 
-    // Send active hand to discard pile
-    s.discardPile = [...s.discardPile, ...hand];
-
-    // Redraw a fresh set of 5 cards
-    let currentDraw = [...s.drawPile];
-    let currentDiscard = [...s.discardPile];
-    const drawn: BulletCard[] = [];
-
-    const drawCount = 5;
-    for (let i = 0; i < drawCount; i++) {
-      if (currentDraw.length === 0) {
-        if (currentDiscard.length === 0) {
-          break;
-        }
-        currentDraw = shuffleArray(currentDiscard);
-        currentDiscard = [];
-
-        s.floatingTexts.push({
-          id: "rs_redraw_" + Math.random(),
-          x: s.player.x,
-          y: s.player.y - 35,
-          text: "🔄 버린 패를 모아 덱 셔플! (Deck Recycled)",
-          color: "#c084fc",
-          vy: -1.2,
-          life: 75
-        });
-      }
-      const card = currentDraw.pop();
-      if (card) {
-        drawn.push(card);
-      }
-    }
-
-    s.drawPile = currentDraw;
-    s.discardPile = currentDiscard;
-    setHand(drawn);
-  };
 
   // Game Engine State stored in Ref for direct 60fps loop callback performance
   const stateRef = useRef({
@@ -599,7 +568,7 @@ export default function GameCanvas({
     return obs;
   };
 
-  const setupRoom = () => {
+  const setupRoom = (inCorridor: boolean = isCorridor) => {
     const s = stateRef.current;
     s.projectiles = [];
     s.enemies = [];
@@ -619,10 +588,9 @@ export default function GameCanvas({
     s.discardPile = [];
     setHand([]);
 
-    setIsCorridor(false);
     setInspectingItem(null);
 
-    if (isCorridor) {
+    if (inCorridor) {
       // Setup corridor hallway bounds
       s.roomBounds = { w: 1200, h: 320 };
       s.player.x = 80;
@@ -642,18 +610,27 @@ export default function GameCanvas({
       s.obstacles.push({ x: 450, y: 220, w: 25, h: 25, type: "gold_node", hp: 10 });
       s.obstacles.push({ x: 880, y: 60, w: 25, h: 25, type: "gold_node", hp: 10 });
 
-      // Spawn gateway portal at end of corridor!
-      if (corridorTarget) {
+      // Spawn gateway portals at end of corridor according to activeRoom.connections!
+      activeRoom.connections.forEach((targetId, idx) => {
+        const targetNode = routeNodes.find((n) => n.id === targetId);
+        if (!targetNode) return;
+
+        // Position dynamically based on number of connections
+        let doorY = 160;
+        if (activeRoom.connections.length === 2) {
+          doorY = idx === 0 ? 90 : 230;
+        }
+
         s.gateways.push({
-          id: "corridor_portal",
+          id: "corridor_gate_" + targetId,
           x: 1140,
-          y: 160,
-          radius: 35,
-          targetNode: corridorTarget,
-          name: corridorTarget.type === RoomType.BOSS ? "⚠️ 보스 결전장" : `➡️ 다음 구역 [${corridorTarget.type}]`,
-          color: "#9c27b0"
+          y: doorY,
+          radius: 32,
+          targetNode,
+          name: getRoomNameKorean(targetNode.type),
+          color: getRoomColor(targetNode.type)
         });
-      }
+      });
       return;
     }
 
@@ -723,21 +700,17 @@ export default function GameCanvas({
 
   const spawnPassiveGates = () => {
     const s = stateRef.current;
-    // For non-hostile rooms, doors are instantly open!
-    activeRoom.connections.forEach((targetId, idx) => {
-      const targetNode = routeNodes.find((n) => n.id === targetId);
-      if (!targetNode) return;
+    if (activeRoom.connections.length === 0) return;
 
-      const doorX = activeRoom.connections.length === 1 ? 500 : 350 + idx * 300;
-      s.gateways.push({
-        id: "gate_" + targetId,
-        x: doorX,
-        y: 80,
-        radius: 30,
-        targetNode,
-        name: getRoomNameKorean(targetNode.type),
-        color: getRoomColor(targetNode.type)
-      });
+    // Spawn a single gateway in the center that transitions into the corridor hallway
+    s.gateways.push({
+      id: "gate_to_corridor",
+      x: 500,
+      y: 80,
+      radius: 32,
+      targetNode: routeNodes.find((n) => n.id === activeRoom.connections[0]) || activeRoom,
+      name: "➡️ 다음 복도 구역 진입 (Enter Corridor Hallway)",
+      color: "#9c27b0"
     });
   };
 
@@ -952,6 +925,10 @@ export default function GameCanvas({
       vy: -0.5,
       life: 80
     });
+
+    if (activeRoom.type !== RoomType.BOSS) {
+      spawnPassiveGates();
+    }
   };
 
   // Trigger doors when card choice is claimed
@@ -964,22 +941,10 @@ export default function GameCanvas({
       return;
     }
 
-    // Open gateways
-    activeRoom.connections.forEach((targetId, idx) => {
-      const targetNode = routeNodes.find((n) => n.id === targetId);
-      if (!targetNode) return;
-
-      const doorX = activeRoom.connections.length === 1 ? 550 : 350 + idx * 300;
-      s.gateways.push({
-        id: "combat_gate_" + targetId,
-        x: doorX,
-        y: 80,
-        radius: 30,
-        targetNode,
-        name: getRoomNameKorean(targetNode.type),
-        color: getRoomColor(targetNode.type)
-      });
-    });
+    // Open gateways if not already done
+    if (s.gateways.length === 0) {
+      spawnPassiveGates();
+    }
 
     s.floatingTexts.push({
       id: "door_op",
@@ -1500,10 +1465,10 @@ export default function GameCanvas({
     stateRef.current.mouse.isDown = false;
   };
 
-  // Re-setup room upon active room / floor changes
+  // Re-setup room upon active room / floor changes or corridor transition
   useEffect(() => {
-    setupRoom();
-  }, [activeRoom.id, playerStats.floor]);
+    setupRoom(isCorridor);
+  }, [activeRoom.id, playerStats.floor, isCorridor, corridorTarget]);
 
   // Main tick loop
   useEffect(() => {
@@ -1552,8 +1517,8 @@ export default function GameCanvas({
 
       // 1. Roll / Dash Physics
       if (s.player.rollDuration > 0) {
-        s.player.x += s.player.rollVx;
-        s.player.y += s.player.rollVy;
+        s.player.x += s.player.rollVx * dt;
+        s.player.y += s.player.rollVy * dt;
         s.player.rollDuration--;
         if (s.player.rollDuration === 0) {
           s.player.isInvulnerable = false;
@@ -1596,8 +1561,9 @@ export default function GameCanvas({
         s.player.vx *= 0.8;
         s.player.vy *= 0.8;
 
-        s.player.x += s.player.vx;
-        s.player.y += s.player.vy;
+        // Scale position step by dt (bullet-time speed factor) to match enemies
+        s.player.x += s.player.vx * dt;
+        s.player.y += s.player.vy * dt;
       }
 
       // Restrict bounds
@@ -1824,8 +1790,12 @@ export default function GameCanvas({
           const obCenterY = ob.y + ob.h / 2;
           const odx = enemy.x - obCenterX;
           const ody = enemy.y - obCenterY;
-          const odist = Math.sqrt(odx * odx + ody * ody);
           const influenceRange = Math.max(ob.w, ob.h) + 25;
+
+          // OPTIMIZATION: Bounding box pre-check to avoid expensive Math.sqrt calls for distant obstacles
+          if (Math.abs(odx) >= influenceRange || Math.abs(ody) >= influenceRange) return;
+
+          const odist = Math.sqrt(odx * odx + ody * ody);
           if (odist < influenceRange && odist > 0) {
             const force = (influenceRange - odist) / influenceRange;
             steerForceX += (odx / odist) * force * 1.6;
@@ -2094,12 +2064,22 @@ export default function GameCanvas({
       });
       s.particles = s.particles.filter((p) => p.life > 0);
 
+      // OPTIMIZATION: Cap maximum concurrent particles to 300 to maintain stable high FPS
+      if (s.particles.length > 300) {
+        s.particles = s.particles.slice(s.particles.length - 300);
+      }
+
       // Move text
       s.floatingTexts.forEach((t) => {
         t.y += t.vy;
         t.life--;
       });
       s.floatingTexts = s.floatingTexts.filter((t) => t.life > 0);
+
+      // OPTIMIZATION: Cap maximum active floating texts to 30 to prevent overlay clutter and lag
+      if (s.floatingTexts.length > 30) {
+        s.floatingTexts = s.floatingTexts.slice(s.floatingTexts.length - 30);
+      }
     };
 
     const damagePlayer = (amt: number) => {
@@ -2592,7 +2572,7 @@ export default function GameCanvas({
     return () => {
       cancelAnimationFrame(frameId);
     };
-  }, [chamber, activeRoom, isCorridor, activeStation, dungeonMapOpen, inspectingItem]);
+  }, [chamber, activeRoom, isCorridor, activeStation, dungeonMapOpen, inspectingItem, isBulletTime]);
 
   // Handle real transition updates between room depth nodes
   const handleEnterNextRoom = (targetNode: RoomNode) => {
@@ -2831,8 +2811,8 @@ export default function GameCanvas({
             <span className="inline-flex items-center gap-2 px-3.5 py-1 bg-[#1e152a]/95 border border-purple-500/35 text-purple-200 text-[10px] font-mono font-black uppercase tracking-wider animate-pulse rounded shadow-lg">
               ⏳ 슬레이 더 스파이어 마력 장전 제어장치 (Reloading Tactical Board)
             </span>
-            <p className="text-[9px] text-gray-300 font-mono tracking-wide mt-1 max-w-sm drop-shadow-[0_1.5px_3px_rgba(0,0,0,0.8)]">
-              손에 쥔 카드를 클릭하거나 아래 자동 버튼을 통해 탄창을 충전하세요!
+            <p className="text-[9px] text-purple-300 font-mono tracking-wide mt-1 max-w-sm drop-shadow-[0_1.5px_3px_rgba(0,0,0,0.8)]">
+              손에 쥔 카드를 클릭하여 약실에 장전하세요! 패를 쓰면 자동으로 덱에서 카드를 보충합니다.
             </p>
           </div>
 
@@ -2855,16 +2835,13 @@ export default function GameCanvas({
                 약실 상태 (Gauge): {chamber.reduce((sum, c) => sum + c.space, 0)} / {chamberCapacity} 칸
               </span>
               <button 
-                onClick={() => setChamber([])} 
+                onClick={() => {
+                  stateRef.current.discardPile.push(...chamber);
+                  setChamber([]);
+                }} 
                 className="px-2 py-0.5 bg-red-950 hover:bg-red-900 text-red-400 border border-red-800/30 text-[9px] rounded font-bold cursor-pointer transition-all"
               >
                 비우기
-              </button>
-              <button 
-                onClick={autoReloadChamber} 
-                className="px-2.5 py-0.5 bg-emerald-950 hover:bg-emerald-900 text-emerald-400 border border-emerald-800/30 text-[9px] rounded font-bold cursor-pointer transition-all ml-1 font-mono"
-              >
-                ⚡ 자동 일괄 장전 (Auto Fill)
               </button>
             </div>
             {/* Visual block queue representation */}
@@ -2895,15 +2872,7 @@ export default function GameCanvas({
             <span className="text-[9.5px] font-mono font-black text-purple-300 mt-1.5">덱 ({stateRef.current.drawPile.length})</span>
           </div>
 
-          {/* Redraw and control widget left side */}
-          <div className="absolute bottom-10 left-40 flex flex-col gap-2 pointer-events-auto">
-            <button
-              onClick={discardAndRedrawHand}
-              className="px-3.5 py-2 bg-purple-950 hover:bg-purple-905 border border-purple-700/50 hover:border-purple-600 text-purple-300 hover:text-white font-mono font-black text-[9.5px] uppercase tracking-wider flex items-center gap-1 cursor-pointer transition-all shadow-md hover:shadow-[0_0_15px_rgba(168,85,247,0.25)] rounded-lg"
-            >
-              🔄 패 교체 (Redraw)
-            </button>
-          </div>
+
 
           {/* Slay the Spire Discard deck pile on the far right */}
           <div className="absolute bottom-10 right-12 p-3 bg-[#120707]/95 border border-red-900/55 rounded-xl flex flex-col items-center justify-center gap-1 pointer-events-auto shadow-[0_0_20px_rgba(239,68,68,0.15)] w-24 select-none">
